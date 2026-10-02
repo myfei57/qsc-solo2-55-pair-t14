@@ -53,6 +53,13 @@ class Api:
         add("GET", "/api/alarms", self._alarms)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/verify", self._verify)
+        add("GET", "/api/audit/chain", self._audit_chain)
+        add("GET", "/api/replay", self._replay)
+        add("GET", "/api/condition", self._condition)
+        add("POST", "/api/segments/fill", self._fill_segments)
+        add("POST", "/api/segments/export", self._export_segment)
+        add("POST", "/api/archive/seal", lambda params, body: self._platform.seal_archives())
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
@@ -176,16 +183,70 @@ class Api:
 
     def _journal(self, params: dict, body: dict) -> dict:
         journal = self._platform.audit.journal
+        # 控制台读单段用宽松口径：坏段标记后跳过，好段照常展示。
+        policy = str(params.get("policy", "lenient"))
         payload: dict = {
             "topic": journal.topic,
             "count": journal.count(),
             "active_segment": journal.active_segment(),
             "segments": journal.segments(),
+            "missing_segments": journal.missing_indices(),
         }
         segment = params.get("segment")
         if segment is not None:
-            payload["records"] = self._platform.audit.replay_segment(int(segment))
+            seg_index = int(segment)
+            read = journal.read_segment(seg_index, policy)
+            payload["segment_read"] = read.as_dict()
+            # 与审计层 replay_segment 同一出口，保证单段回放口径一致。
+            payload["records"] = self._platform.audit.replay_segment(seg_index, policy)
         return payload
+
+    def _verify(self, params: dict, body: dict) -> dict:
+        # 控制台默认宽松（全段体检并标记）；?policy=strict 走取证口径，坏段即 409。
+        policy = str(params.get("policy", "lenient"))
+        return self._platform.verify_chain(policy)
+
+    def _audit_chain(self, params: dict, body: dict) -> dict:
+        # 轻量链状态：用最近一次校验结果（无则现场宽松扫一遍，不写审计）。
+        journal = self._platform.audit.journal
+        return {
+            "checks": self._platform.audit.verification(),
+            "heads": journal.chain_heads(),
+            "missing_segments": journal.missing_indices(),
+        }
+
+    def _replay(self, params: dict, body: dict) -> dict:
+        policy = str(params.get("policy", "lenient"))
+        start = params.get("start_ts")
+        end = params.get("end_ts")
+        signals_param = params.get("signals")
+        signals = None
+        if signals_param:
+            signals = [item.strip() for item in str(signals_param).split(",") if item.strip()]
+        return self._platform.replay(
+            policy=policy,
+            start_ts=None if start is None else float(start),
+            end_ts=None if end is None else float(end),
+            signals=signals,
+        )
+
+    def _condition(self, params: dict, body: dict) -> dict:
+        ts = float(params.get("ts", self._platform.clock.now()))
+        return self._platform.working_condition(ts, policy=str(params.get("policy", "lenient")))
+
+    def _fill_segments(self, params: dict, body: dict) -> dict:
+        source = str(body.get("source_dir", "")).strip()
+        if not source:
+            raise PlantError("补段需要 source_dir（补段包目录）", component="console")
+        return self._platform.fill_audit_segments(source)
+
+    def _export_segment(self, params: dict, body: dict) -> dict:
+        segment = int(body.get("segment", -1))
+        dest = str(body.get("dest", "")).strip()
+        if not dest:
+            raise PlantError("导出补段包需要 dest（目标目录）", component="console")
+        path = self._platform.export_audit_segment(segment, dest)
+        return {"segment": segment, "bundle": path}
 
     def _store(self, params: dict, body: dict) -> dict:
         return {

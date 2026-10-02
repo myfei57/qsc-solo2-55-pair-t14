@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import Callable
 
 
 @dataclass(frozen=True)
@@ -22,13 +23,19 @@ class Sample:
         return {"ts": round(self.ts, 3), "value": round(self.value, 4)}
 
 
+# 采样落盘时交给 sink 的字段；sink 一般是往趋势自己的链式流水里追加。
+# 趋势与审计共用同一个 ``ts`` 时间轴（同一台 Clock），这是回放同轴对齐的前提。
+TrendSink = Callable[[str, float, float], None]
+
+
 class TrendBuffer:
     """按信号名保存有限长度的趋势样本。"""
 
-    def __init__(self, limit: int = 2048, period_s: float = 5.0) -> None:
+    def __init__(self, limit: int = 2048, period_s: float = 5.0, sink: TrendSink | None = None) -> None:
         self._series: dict[str, list[Sample]] = {}
         self._limit = max(1, limit)
         self._period_s = max(0.001, period_s)
+        self._sink = sink
         self._lock = threading.RLock()
 
     @property
@@ -36,13 +43,16 @@ class TrendBuffer:
         return self._period_s
 
     def append(self, signal: str, ts: float, value: float) -> None:
-        """追加一个采样点，超出上限时丢弃最旧的样本。"""
+        """追加一个采样点，超出上限时丢弃最旧的样本，并按需落盘。"""
 
         with self._lock:
             series = self._series.setdefault(signal, [])
             series.append(Sample(ts, float(value)))
             if len(series) > self._limit:
                 del series[: len(series) - self._limit]
+        # 落盘放在锁外，避免与存储 IO 互持；单写线程语义由调用方（控制循环）保证。
+        if self._sink is not None:
+            self._sink(signal, float(ts), float(value))
 
     def latest(self, signal: str) -> Sample | None:
         """返回某信号的最后一个样本。"""
@@ -82,6 +92,16 @@ class TrendBuffer:
                 filled.append(Sample(ts, value))
             filled.append(current)
         return filled
+
+    def load(self, signal: str, samples: list[Sample]) -> None:
+        """把跨重启从链式流水读回的样本灌回内存（去重、按时间排序）。"""
+
+        with self._lock:
+            merged = {sample.ts: sample for sample in self._series.get(signal, ())}
+            for sample in samples:
+                merged[sample.ts] = sample
+            ordered = sorted(merged.values(), key=lambda item: item.ts)[-self._limit :]
+            self._series[signal] = ordered
 
     def snapshot(self, limit: int = 8) -> dict:
         """汇总各信号的最新样本，供状态快照读取。"""

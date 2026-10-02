@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import dataclasses
 import math
+import os
 import threading
 
 from .alarm.escalation import EscalationPolicy
@@ -56,10 +57,11 @@ from .steam.pressure import SteamPressure
 from .steam.system import SteamSystem
 from .steam.turbine import Turbine
 from .steam.turbine_load import LoadRamp
+from .store.chain import LENIENT, STRICT, ChainedJournal
 from .store.jsonfile import JsonStore
-from .store.journal import JsonlJournal
 from .store.metrics import StoreMetrics
-from .telemetry import TrendBuffer
+from .audit.replay import SHARED_AXIS, replay_shared_axis, working_condition_at
+from .telemetry import Sample, TrendBuffer
 from .temp.ambient import AmbientModel
 from .temp.profile import TemperatureProfile
 from .temp.solar import ClearSkyProfile
@@ -106,12 +108,22 @@ class Platform:
         store = JsonStore(self.config.storage_root)
         self.store = store
         self.metrics = StoreMetrics(store.root)
+        self.audit_secret = self._audit_secret()
         self.audit = AuditLog(
-            self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
+            self.clock,
+            self.bus,
+            ChainedJournal(store.root, "audit", segment_limit=512, secret=self.audit_secret),
+        )
+        # 趋势用自己的一条链式流水，与审计同一把 Clock 时间戳；封段/校验/补段
+        # 机制与审计完全一致，使两条流都能按同一条时间轴可信回放。
+        self.trend_journal = ChainedJournal(
+            store.root, "trend", segment_limit=2048, secret=self.audit_secret
         )
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
-        self.trend = TrendBuffer(period_s=self.config.irradiance.sample_period_s)
+        self.trend = TrendBuffer(
+            period_s=self.config.irradiance.sample_period_s, sink=self._persist_trend_sample
+        )
         self.ids = IdFactory("op")
 
         self.zones = ZoneRegistry()
@@ -238,15 +250,51 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        self._restore_trend()
+        # 跨重启的联锁恢复走取证口径：审计链不完整就拒绝采信，避免据被改过的
+        # 流水错误置位联锁。坏/缺段的处置留给显式校验与补段流程。
         try:
-            records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
-        except PlantError:
+            records = self.audit.to_records(self.audit.replay_verified(limit=100_000))
+        except Exception as error:  # noqa: BLE001 - 链不可信时不据回放置位，但平台仍可启动
+            self.audit.record(
+                AuditRecord.create(
+                    self.clock.now(), "", "audit", "audit_restore_skipped",
+                    severity="warning",
+                    message="跨重启回放因审计链校验未通过而跳过",
+                    reason=getattr(error, "kind", type(error).__name__),
+                    failed_segment=getattr(error, "segment", -1),
+                )
+            )
             return
         trips = [item for item in records if item.action == "receiver_trip_complete"]
         if trips:
             last = trips[-1]
             reason = str(last.payload.get("reason", "unknown"))
             self.latch.trip("receiver", reason, last.ts)
+
+    @staticmethod
+    def _audit_secret() -> str | None:
+        """段清单 HMAC 密钥：配了环境变量就对清单签名，否则只做哈希链。"""
+
+        return os.environ.get("CSP_AUDIT_SECRET") or None
+
+    def _persist_trend_sample(self, signal: str, ts: float, value: float) -> None:
+        """把一个趋势样本追加进趋势自己的链式流水（与审计同轴）。"""
+
+        self.trend_journal.append({"ts": float(ts), "signal": signal, "value": float(value)})
+
+    def _restore_trend(self) -> None:
+        """把趋势链式流水（宽松口径）读回内存，坏段跳过、好段按时间灌回。"""
+
+        raw, _reads = self.trend_journal.read_all(LENIENT)
+        for item in raw:
+            signal = item.get("signal")
+            if not isinstance(signal, str):
+                continue
+            try:
+                self.trend.load(signal, [Sample(float(item["ts"]), float(item["value"]))])
+            except (TypeError, ValueError):
+                continue
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -340,6 +388,11 @@ class Platform:
             summary = self._record_operation(op_id, "shutdown", report)
             self._operations += 1
             self._persist()
+            # 停运即归档：把审计与趋势当前段封死（数据移入 sealed/ 并附清单），
+            # 之后读回来按段号升序、时间不乱。先封趋势，再封审计，让"已归档"
+            # 成为本次审计流水里最后落盘的一件事。
+            self.trend_journal.seal()
+            self.audit.seal()
             return {**report, **summary}
 
     def start_plant(
@@ -809,6 +862,137 @@ class Platform:
             )
         )
         return record
+
+    def reset_state(self) -> bool:
+        """清掉落盘的平台计数（交付前重新标定用）。"""
+
+        if not self.store.exists("platform_state"):
+            return False
+        return self.store.remove("platform_state")
+
+    # ---- 链校验 / 补段 / 同轴回放 ------------------------------------
+
+    def seal_archives(self) -> dict:
+        """封好审计与趋势当前活动段（归档前调用），返回两份清单摘要。"""
+
+        with self._lock:
+            return {"audit": self.audit.seal(), "trend": self.trend_journal.seal()}
+
+    def verify_chain(self, policy: str = LENIENT) -> dict:
+        """校验审计与趋势两条段链。STRICT 遇坏/缺段抛 SegmentIntegrityError。"""
+
+        audit_reads = self.audit.verify(policy)
+        trend_reads = self.trend_journal.verify(policy)
+        return {
+            "policy": policy,
+            "audit": [read.as_dict() for read in audit_reads],
+            "trend": [read.as_dict() for read in trend_reads],
+            "audit_ok": all(read.ok for read in audit_reads),
+            "trend_ok": all(read.ok for read in trend_reads),
+            "missing": {
+                "audit": self.audit.journal.missing_indices(),
+                "trend": self.trend_journal.missing_indices(),
+            },
+        }
+
+    def fill_audit_segments(self, source_dir: str) -> dict:
+        """从补段包目录补齐缺失审计段（部分失败、守时序、动作落审计、幂等）。"""
+
+        with self._lock:
+            return self.audit.fill_missing(source_dir)
+
+    def export_audit_segment(self, index: int, dest: str) -> str:
+        """导出一个审计段为补段包，供副本拿去补缺。"""
+
+        from .store.chain import export_segment_bundle
+
+        return export_segment_bundle(self.audit.journal, index, dest)
+
+    def replay(
+        self,
+        *,
+        policy: str = LENIENT,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        signals: list[str] | None = None,
+        limit_audit: int = 100_000,
+        annotate: bool = True,
+    ) -> dict:
+        """审计 × 趋势按同一条时间轴回放，还原当时工况。
+
+        审计与趋势都从各自链式流水按同一 ``policy`` 读盘并验段：STRICT 链不完整
+        就整段拒读（取证），LENIENT 坏段跳过、好段照读（控制台）。合并只按统一
+        时间戳排序（同轴，模式定死）。回放这一动作本身落审计，返回体同时可供
+        控制台展示。
+        """
+
+        with self._lock:
+            audit_raw, audit_reads = self.audit.journal.read_all(policy)
+            trend_raw, trend_reads = self.trend_journal.read_all(policy)
+            audit_records = self.audit.to_records(audit_raw[-limit_audit:])
+            trend_samples: dict[str, list[Sample]] = {}
+            for item in trend_raw:
+                signal = item.get("signal")
+                if not isinstance(signal, str):
+                    continue
+                if signals is not None and signal not in signals:
+                    continue
+                try:
+                    trend_samples.setdefault(signal, []).append(
+                        Sample(float(item["ts"]), float(item["value"]))
+                    )
+                except (TypeError, ValueError):
+                    continue
+            window = replay_shared_axis(
+                audit_records,
+                trend_samples,
+                audit_reads + trend_reads,
+                policy=policy,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                signals=signals,
+            )
+            result = window.as_dict()
+            result["signals_present"] = sorted(trend_samples)
+            if annotate:
+                self.audit._write_meta(
+                    "audit_replay",
+                    "notice" if window.trustworthy else "warning",
+                    "同轴回放完成" if window.trustworthy else "同轴回放完成（含坏/缺段，部分时刻不可信）",
+                    policy=policy,
+                    axis=SHARED_AXIS,
+                    events=len(window.events),
+                    start_ts=window.start_ts,
+                    end_ts=window.end_ts,
+                    bad_segments=window.bad_segments,
+                    missing_segments=window.missing_segments,
+                )
+            return result
+
+    def working_condition(self, ts: float, *, policy: str = LENIENT) -> dict:
+        """在同轴回放轴上还原指定时刻的工况（最近采样 + 已发生审计事件）。"""
+
+        audit_raw, audit_reads = self.audit.journal.read_all(policy)
+        trend_raw, trend_reads = self.trend_journal.read_all(policy)
+        window = replay_shared_axis(
+            self.audit.to_records(audit_raw),
+            self._group_trend(trend_raw),
+            audit_reads + trend_reads,
+            policy=policy,
+        )
+        return working_condition_at(window, ts)
+
+    @staticmethod
+    def _group_trend(raw: list[dict]) -> dict[str, list[Sample]]:
+        grouped: dict[str, list[Sample]] = {}
+        for item in raw:
+            signal = item.get("signal")
+            if isinstance(signal, str):
+                try:
+                    grouped.setdefault(signal, []).append(Sample(float(item["ts"]), float(item["value"])))
+                except (TypeError, ValueError):
+                    continue
+        return grouped
 
     def reset_state(self) -> bool:
         """清掉落盘的平台计数（交付前重新标定用）。"""
