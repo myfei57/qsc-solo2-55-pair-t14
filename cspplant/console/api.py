@@ -21,6 +21,12 @@ def _as_float(body: dict, key: str, default: float) -> float:
         raise PlantError(f"参数 {key!r} 必须是数值", component="console") from error
 
 
+def _optional_float(value: object) -> float | None:
+    if value is None or value == "":
+        return None
+    return float(value)  # 非法值由外层 400 兜底
+
+
 class Api:
     """把 HTTP 请求翻译成平台调用。"""
 
@@ -50,9 +56,14 @@ class Api:
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/events", self._events)
         add("GET", "/api/audit", self._audit)
+        add("GET", "/api/audit/verified", self._audit_verified)
         add("GET", "/api/alarms", self._alarms)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/journal", self._journal)
+        add("GET", "/api/journal/verify", lambda params, body: self._platform.verify_archives())
+        add("POST", "/api/journal/seal", lambda params, body: self._platform.seal_archives())
+        add("POST", "/api/journal/fill", self._journal_fill)
+        add("GET", "/api/replay", self._replay)
         add("GET", "/api/store", self._store)
         add("GET", "/api/readiness", self._readiness)
         add("GET", "/api/window", lambda params, body: {"mirrors": self._platform.mirrors_in_window()})
@@ -161,6 +172,15 @@ class Api:
         limit = int(params.get("limit", 100))
         return {"entries": self._platform.audit.entries(limit=limit)}
 
+    def _audit_verified(self, params: dict, body: dict) -> dict:
+        # 展示用途：marked 标记后部分读，问题段跳过并在 skipped 里点名。
+        policy = str(params.get("policy", "marked"))
+        return self._platform.audit.read_for_console(
+            policy=policy,
+            start_ts=_optional_float(params.get("start_ts")),
+            end_ts=_optional_float(params.get("end_ts")),
+        )
+
     def _alarms(self, params: dict, body: dict) -> dict:
         limit = int(params.get("limit", 20))
         return {
@@ -181,11 +201,36 @@ class Api:
             "count": journal.count(),
             "active_segment": journal.active_segment(),
             "segments": journal.segments(),
+            "chain": self._platform.audit.verify_chain(),
         }
         segment = params.get("segment")
         if segment is not None:
             payload["records"] = self._platform.audit.replay_segment(int(segment))
         return payload
+
+    def _journal_fill(self, params: dict, body: dict) -> dict:
+        seq = body.get("segment")
+        policy = str(body.get("policy", "marked"))
+        return self._platform.fill_audit_gaps(
+            None if seq is None else int(seq),
+            note=str(body.get("note", "console_fill")),
+        )
+
+    def _replay(self, params: dict, body: dict) -> dict:
+        # 控制台展示按 marked：问题段标记并跳过后部分读，不把整次回放拒掉。
+        policy = str(params.get("policy", "marked"))
+        asset = params.get("asset")
+        signals_param = params.get("signals")
+        signals = None
+        if signals_param:
+            signals = [item.strip() for item in str(signals_param).split(",") if item.strip()]
+        return self._platform.replay_plant(
+            policy=policy,
+            asset=asset,
+            signals=signals,
+            start_ts=_optional_float(params.get("start_ts")),
+            end_ts=_optional_float(params.get("end_ts")),
+        )
 
     def _store(self, params: dict, body: dict) -> dict:
         return {

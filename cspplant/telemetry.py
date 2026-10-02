@@ -1,14 +1,22 @@
-"""趋势缓冲与补点。
+"""趋势缓冲、补点与落盘。
 
 现场采样可能因为机械动作被抢占而丢点，控制台要展示的是按固定周期对齐的
-趋势而不是原始采样流。:class:`TrendBuffer` 按信号名收集样本，并可对缺失
-周期做线性补点，供状态页与审计回放共用。
+趋势而不是原始采样流。:class:`TrendBuffer` 按信号名收集样本（内存，给状态
+页读最新值），并可通过 sink 回调把每个样本同步落盘：平台装配时挂的是一份
+和审计流水同构的链式 :class:`~cspplant.store.journal.JsonlJournal`，于是趋势
+跨重启也能按同一条时间轴回放，而不是只活在内存里。
 """
 
 from __future__ import annotations
 
 import threading
 from dataclasses import dataclass
+from typing import Callable
+
+#: 样本落盘记录的字段。
+SINK_FIELDS = ("ts", "signal", "value")
+
+TrendSink = Callable[[str, float, float], None]
 
 
 @dataclass(frozen=True)
@@ -23,26 +31,49 @@ class Sample:
 
 
 class TrendBuffer:
-    """按信号名保存有限长度的趋势样本。"""
+    """按信号名保存有限长度的趋势样本，并可同步落盘。"""
 
     def __init__(self, limit: int = 2048, period_s: float = 5.0) -> None:
         self._series: dict[str, list[Sample]] = {}
         self._limit = max(1, limit)
         self._period_s = max(0.001, period_s)
+        self._sinks: list[TrendSink] = []
         self._lock = threading.RLock()
 
     @property
     def period_s(self) -> float:
         return self._period_s
 
+    @property
+    def limit(self) -> int:
+        return self._limit
+
+    def add_sink(self, sink: TrendSink) -> None:
+        """挂一个落盘回调，``append`` 时在同一把锁内调用。"""
+
+        with self._lock:
+            self._sinks.append(sink)
+
     def append(self, signal: str, ts: float, value: float) -> None:
-        """追加一个采样点，超出上限时丢弃最旧的样本。"""
+        """追加一个采样点，超出上限时丢弃最旧的样本，并同步给落盘回调。"""
 
         with self._lock:
             series = self._series.setdefault(signal, [])
             series.append(Sample(ts, float(value)))
             if len(series) > self._limit:
                 del series[: len(series) - self._limit]
+            for sink in list(self._sinks):
+                sink(signal, ts, float(value))
+
+    def load(self, signal: str, samples: list[tuple[float, float]]) -> int:
+        """批量灌入历史样本（跨重启从趋势流水恢复内存视图），不落盘。"""
+
+        with self._lock:
+            series = self._series.setdefault(signal, [])
+            series.extend(Sample(ts, float(value)) for ts, value in samples)
+            if len(series) > self._limit:
+                del series[: len(series) - self._limit]
+            return len(series)
 
     def latest(self, signal: str) -> Sample | None:
         """返回某信号的最后一个样本。"""

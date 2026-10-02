@@ -8,7 +8,8 @@ from __future__ import annotations
 
 from .log import AuditLog
 from .record import AuditRecord
+from .replay import CO_AXIS, co_axis_replay
 from .report import summarize
 from .timeline import build_timeline
 
-__all__ = ["AuditLog", "AuditRecord", "summarize", "build_timeline"]
+__all__ = ["AuditLog", "AuditRecord", "summarize", "build_timeline", "co_axis_replay", "CO_AXIS"]

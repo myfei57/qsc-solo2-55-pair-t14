@@ -96,11 +96,18 @@ def test_api_alarm_endpoints(platform):
 
 def test_pages_render_for_every_path(platform):
     platform.start()
+    expected_titles = {
+        "/": "镜场控制台",
+        "/receiver": "吸热器控制台",
+        "/salt": "熔盐控制台",
+        "/alarms": "告警控制台",
+        "/audit": "审计归档与回放",
+    }
     for path in PAGE_PATHS:
         html = render_page(path, platform)
         assert html is not None
         assert html.startswith("<!doctype html>")
-        assert "镜场控制台" in html or "吸热器控制台" in html or "熔盐控制台" in html or "告警控制台" in html
+        assert expected_titles[path] in html
     assert render_page("/nope", platform) is None
 
 

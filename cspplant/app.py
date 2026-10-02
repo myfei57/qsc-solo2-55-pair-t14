@@ -109,9 +109,12 @@ class Platform:
         self.audit = AuditLog(
             self.clock, self.bus, JsonlJournal(store.root, "audit", segment_limit=512)
         )
+        # 趋势同样按链式分段落盘，回放时才能和审计同轴对齐。
+        self.trend_journal = JsonlJournal(store.root, "trend", segment_limit=512)
+        self.trend = TrendBuffer(period_s=self.config.irradiance.sample_period_s)
+        self.trend.add_sink(self._persist_trend_sample)
         self.namespaces = NamespaceRegistry(unit)
         self.topology: Topology = build_default_topology()
-        self.trend = TrendBuffer(period_s=self.config.irradiance.sample_period_s)
         self.ids = IdFactory("op")
 
         self.zones = ZoneRegistry()
@@ -231,6 +234,13 @@ class Platform:
         ):
             self.namespaces.register(area, device, kind)
 
+    def _persist_trend_sample(self, signal: str, ts: float, value: float) -> None:
+        """把一个趋势样本写进链式分段流水（TrendBuffer 的 sink 回调）。"""
+
+        self.trend_journal.append(
+            {"ts": round(ts, 3), "signal": signal, "value": round(value, 4)}
+        )
+
     def _restore(self) -> None:
         """从落盘状态恢复平台计数，并回放最近一次停堆原因。"""
 
@@ -238,6 +248,18 @@ class Platform:
         if isinstance(state, dict):
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
+        # 趋势内存视图从链式流水恢复；恢复用途按 strict 读，被改过的流水不进内存。
+        try:
+            trend_records = self.trend_journal.read_verified(policy="strict")["records"]
+        except PlantError:
+            trend_records = []
+        grouped: dict[str, list[tuple[float, float]]] = {}
+        for item in trend_records:
+            grouped.setdefault(str(item.get("signal", "")), []).append(
+                (float(item.get("ts", 0.0)), float(item.get("value", 0.0)))
+            )
+        for signal, samples in grouped.items():
+            self.trend.load(signal, samples[-self.trend.limit:])
         try:
             records = self.audit.to_records(self.audit.replay_from_journal(limit=100_000))
         except PlantError:
@@ -255,6 +277,57 @@ class Platform:
             "platform_state",
             {"operations": self._operations, "cycles": self._cycles, "unit": self.unit},
         )
+
+    def seal_archives(self) -> dict:
+        """把审计与趋势当前正在写的尾段立即封档归档。"""
+
+        with self._lock:
+            return {
+                "audit": self.audit.seal_segment(),
+                "trend": self.trend_journal.seal_active(),
+            }
+
+    def verify_archives(self) -> dict:
+        """校验审计与趋势两段哈希链，指出缺段/改段与具体段号。"""
+
+        with self._lock:
+            return {
+                "audit": self.audit.verify_chain(),
+                "trend": self.trend_journal.verify_chain(),
+            }
+
+    def fill_audit_gaps(self, seq: int | None = None, note: str = "") -> dict:
+        """补齐缺失审计段（部分失败、幂等、动作落审计）。"""
+
+        with self._lock:
+            return self.audit.fill_missing_segments(seq, note=note)
+
+    def replay_plant(
+        self,
+        *,
+        policy: str = "marked",
+        asset: str | None = None,
+        signals: list[str] | None = None,
+        start_ts: float | None = None,
+        end_ts: float | None = None,
+        audit: bool = True,
+    ) -> dict:
+        """审计与趋势同轴对齐回放，还原当时工况；结果落审计。
+
+        控制台页面轮询展示时传 ``audit=False``，避免每次刷新都往流水里写；
+        显式的 API/CLI 回放默认落审计。
+        """
+
+        with self._lock:
+            return self.audit.replay_co_axis(
+                self.trend_journal,
+                policy=policy,
+                asset=asset,
+                signals=signals,
+                start_ts=start_ts,
+                end_ts=end_ts,
+                audit=audit,
+            )
 
     def _record_operation(self, op_id: str, operation: str, report: dict) -> dict:
         """把编排步骤逐条写审计，并记一条汇总事件。"""
@@ -340,6 +413,8 @@ class Platform:
             summary = self._record_operation(op_id, "shutdown", report)
             self._operations += 1
             self._persist()
+            # 停运即归档：把审计与趋势尾段封档，封好的段读回来时序可跨段校验。
+            self.seal_archives()
             return {**report, **summary}
 
     def start_plant(

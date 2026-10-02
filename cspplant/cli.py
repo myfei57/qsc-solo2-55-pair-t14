@@ -7,6 +7,9 @@
             并发探测 → 手动接管 → 清洗 → 冷热罐切换 → 停堆与复位），用于交付
             前的真实运行检查；
 ``status``  打印当前状态快照；
+``verify``  校验审计/趋势分段哈希链，指出缺段与被改段的段号；
+``fill``    补齐缺失的审计段（幂等，补段动作落审计）；
+``replay``  审计与趋势按同轴对齐回放，还原当时工况；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
 """
@@ -87,6 +90,8 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     if args.fast:
         clock.advance(config.alarm.latch_reset_delay_s + 1.0)
     reset = platform.reset_trip("demo-operator")
+    # 演示结束即归档：审计与趋势尾段封档，读回来按跨段哈希链校验。
+    sealed = platform.seal_archives()
 
     # 演示自检用临时端口，避免和本机常驻服务抢 8080。
     server = ConsoleServer(platform, port=0)
@@ -150,6 +155,38 @@ def _cmd_status(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_verify(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    report = platform.verify_archives()
+    _dump(report)
+    return 0 if report["audit"]["healthy"] and report["trend"]["healthy"] else 3
+
+
+def _cmd_fill(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    report = platform.fill_audit_gaps(args.segment, note=args.note)
+    _dump(report)
+    return 0 if report["ok"] else 4
+
+
+def _cmd_replay(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    signals = [item.strip() for item in args.signals.split(",") if item.strip()] if args.signals else None
+    report = platform.replay_plant(
+        policy=args.policy,
+        asset=args.asset,
+        signals=signals,
+        start_ts=args.start_ts,
+        end_ts=args.end_ts,
+    )
+    if args.timeline:
+        _dump(report)
+    else:
+        # 默认只给控制台/巡检摘要，避免整段时间线刷屏；--timeline 才展开。
+        _dump({key: report[key] for key in ("alignment", "complete", "policy", "window", "counts", "integrity", "series")})
+    return 0 if report["complete"] else 5
+
+
 def _cmd_config(args: argparse.Namespace) -> int:
     config_path = getattr(args, "config", None)
     config = load_config(config_path) if config_path else default_config()
@@ -195,6 +232,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)
+
+    verify = sub.add_parser("verify", help="校验审计/趋势分段哈希链", parents=[common])
+    verify.set_defaults(func=_cmd_verify)
+
+    fill = sub.add_parser("fill", help="补齐缺失的审计段", parents=[common])
+    fill.add_argument("--segment", type=int, default=None, help="只补指定段号，默认补全部缺段")
+    fill.add_argument("--note", default="cli_fill", help="补段依据备注，随审计落盘")
+    fill.set_defaults(func=_cmd_fill)
+
+    replay = sub.add_parser("replay", help="审计与趋势同轴对齐回放", parents=[common])
+    replay.add_argument("--policy", choices=("strict", "marked", "lenient"), default="marked")
+    replay.add_argument("--asset", default=None, help="只回放指定工位的审计")
+    replay.add_argument("--signals", default=None, help="逗号分隔的趋势信号名")
+    replay.add_argument("--start-ts", type=float, default=None, dest="start_ts")
+    replay.add_argument("--end-ts", type=float, default=None, dest="end_ts")
+    replay.add_argument("--timeline", action="store_true", help="展开完整同轴时间线")
+    replay.set_defaults(func=_cmd_replay)
 
     config = sub.add_parser("config", help="打印生效配置", parents=[common])
     config.set_defaults(func=_cmd_config)

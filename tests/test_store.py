@@ -40,7 +40,7 @@ def test_journal_rolls_segments_and_replays(tmp_path):
     assert journal.active_segment() == 2
     assert len(journal.segments()) == 3
     assert [item["index"] for item in journal.read_segment(1)] == [2, 3]
-    assert len(journal.read_all()) == 5
+    assert len(journal.read_verified(policy='strict')['records']) == 5
     assert journal.read_segment(99) == []
 
 
@@ -52,7 +52,7 @@ def test_journal_resumes_count_after_reopen(tmp_path):
     assert second.count() == 2
     second.append({"index": 2})
     assert second.active_segment() == 1
-    assert len(second.read_all()) == 3
+    assert len(second.read_verified(policy='strict')['records']) == 3
 
 
 def test_store_metrics_counts_files(tmp_path):

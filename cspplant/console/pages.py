@@ -11,7 +11,7 @@ from html import escape
 
 from ..app import Platform
 
-PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms")
+PAGE_PATHS: tuple[str, ...] = ("/", "/receiver", "/salt", "/alarms", "/audit")
 
 _STYLE = """
 body { font-family: ui-sans-serif, system-ui, sans-serif; margin: 0; background: #0f1720; color: #e6edf3; }
@@ -27,11 +27,17 @@ th { background: #17222e; }
 """
 
 
-def _table(title: str, rows: list[tuple[str, object]]) -> str:
-    """渲染一张两列数据表。"""
+def _table(title: str, rows: list[tuple[object, ...]]) -> str:
+    """渲染一张表（首格作表头列，其余作数据列；支持任意列数）。"""
 
     body = "".join(
-        f"<tr><th>{escape(str(key))}</th><td>{escape(str(value))}</td></tr>" for key, value in rows
+        "<tr>"
+        + "".join(
+            f"<th>{escape(str(cell))}</th>" if index == 0 else f"<td>{escape(str(cell))}</td>"
+            for index, cell in enumerate(row)
+        )
+        + "</tr>"
+        for row in rows
     )
     return f"<h2>{escape(title)}</h2><table>{body}</table>"
 
@@ -46,6 +52,7 @@ def _shell(title: str, body: str) -> str:
             ("/receiver", "吸热器"),
             ("/salt", "熔盐"),
             ("/alarms", "告警"),
+            ("/audit", "审计归档"),
         )
     )
     return (
@@ -147,11 +154,77 @@ def _alarm_page(platform: Platform) -> str:
     return _shell("告警控制台", body)
 
 
+_STATUS_LABEL = {
+    "ok": "完好",
+    "unsealed": "写入中",
+    "altered": "被篡改",
+    "broken_link": "链接断开",
+    "time_disorder": "时序错乱",
+    "missing": "缺失",
+    "gap": "缺段占位",
+    "legacy": "旧段",
+}
+
+
+def _audit_page(platform: Platform) -> str:
+    """审计归档页：跨段哈希链状态与同轴回放工况帧。"""
+
+    verification = platform.verify_archives()
+    chain = verification["audit"]
+    rows = [
+        ("审计链是否完好", "是" if chain["healthy"] else "否（见下段明细）"),
+        ("缺段", chain["missing"] or "-"),
+        ("被改/断链/乱序段", chain["altered"] or "-"),
+        ("缺段占位段", chain["gaps"] or "-"),
+        (
+            "可信根",
+            "-"
+            if chain["anchor"] is None
+            else f"尾段 {chain['anchor']['tail_seq']}（{chain['anchor']['tail_digest'][:12]}…）",
+        ),
+    ]
+    body = _table("审计跨段校验", rows)
+
+    seg_rows = [
+        (
+            seg["seq"],
+            _STATUS_LABEL.get(seg["status"], seg["status"]),
+            seg["count"],
+            seg["detail"] or "-",
+        )
+        for seg in chain["segments"]
+    ] or [("-", "暂无段", 0, "-")]
+    body += _table("分段明细（段号 / 状态 / 条数 / 说明）", seg_rows)
+
+    # 同轴回放（marked：问题段标记后部分读），还原最近工况帧；页面轮询不落审计。
+    replay = platform.replay_plant(policy="marked", audit=False)
+    head_rows = [
+        ("回放口径", "同轴对齐（审计与趋势同一时间轴）"),
+        ("是否完整", "是" if replay["complete"] else "否（存在缺口或不可信段）"),
+        ("审计事件 / 趋势采样 / 工况帧", f"{replay['counts']['audit']} / {replay['counts']['trend']} / {replay['counts']['frames']}"),
+        ("跳过的审计段", [seg["seq"] for seg in replay["integrity"]["audit_skipped"]] or "-"),
+    ]
+    body += _table("同轴回放（marked 部分读）", head_rows)
+
+    frame_rows: list[tuple[str, object]] = []
+    for frame in replay["frames"][-12:]:
+        actions = "；".join(
+            f"{item['component']}.{item['action']}" for item in frame["audit"]
+        ) or "-"
+        trend = "，".join(f"{key}={value}" for key, value in sorted(frame["trend"].items())) or "-"
+        frame_rows.append((frame["ts"], actions, trend))
+    if not frame_rows:
+        frame_rows = [("-", "暂无可回放内容", "-")]
+    body += _table("最近工况帧（时间 / 处置 / 当时趋势）", frame_rows)
+    return _shell("审计归档与回放", body)
+
+
 _RENDERERS = {
     "/": _mirror_page,
     "/receiver": _receiver_page,
     "/salt": _salt_page,
     "/alarms": _alarm_page,
+    "/audit": _audit_page,
 }
 
 
